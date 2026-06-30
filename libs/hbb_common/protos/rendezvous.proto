@@ -21,6 +21,8 @@ message PunchHoleRequest {
   string licence_key = 3;
   ConnType conn_type = 4;
   string token = 5;
+  // [ICE experiment] initiator's server-reflexive candidate "ip:port" from public STUN.
+  string ice_srflx = 11;
 }
 
 message PunchHole { 
@@ -28,6 +30,8 @@ message PunchHole {
   string relay_server = 2;
   NatType nat_type = 3;
   string request_region = 4;
+  // [ICE experiment] initiator's srflx candidate, copied verbatim from the request.
+  string ice_srflx = 10;
 }
 
 message TestNatRequest {
@@ -53,6 +57,8 @@ message PunchHoleSent {
   NatType nat_type = 4;
   string version = 5;
   string request_region = 6;
+  // [ICE experiment] controlled peer's server-reflexive candidate "ip:port".
+  string ice_srflx = 8;
 }
 
 message RegisterPk {
@@ -92,6 +98,8 @@ message PunchHoleResponse {
     bool is_local = 6;
   }
   string other_failure = 7;
+  // [ICE experiment] controlled peer's srflx candidate, copied verbatim from PunchHoleSent.
+  string ice_srflx = 12;
 }
 
 message ConfigUpdate {

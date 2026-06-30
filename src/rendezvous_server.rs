@@ -771,6 +771,9 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            // [ICE experiment] forward the controlled peer's srflx candidate to the
+            // initiator so it can punch directly (the proxy hides the real address).
+            ice_srflx: phs.ice_srflx.clone(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -932,6 +935,9 @@ impl RendezvousServer {
                     socket_addr,
                     nat_type: ph.nat_type,
                     relay_server,
+                    // [ICE experiment] forward the initiator's srflx candidate to the
+                    // controlled peer so it can punch directly instead of relaying.
+                    ice_srflx: ph.ice_srflx.clone(),
                     ..Default::default()
                 });
             }
