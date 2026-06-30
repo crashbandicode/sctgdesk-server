@@ -118,6 +118,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // Persistent registry of live WebSocket peer sinks, keyed by their connection
+    // address. Required so the server can push PunchHole/relay signaling down a
+    // ws peer's existing outbound connection (ws/Cloudflare clients have no UDP).
+    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -167,6 +171,7 @@ impl RendezvousServer {
         let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            ws_map: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -380,7 +385,7 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr).await;
+                    let response = self.handle_register_pk(rk, addr, false).await;
                     match response {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -530,7 +535,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr).await;
+                    let response = self.handle_register_pk(rk, addr, ws).await;
                     match response {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -548,6 +553,14 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             Self::send_to_sink(sink, msg_out).await;
+                            if ws {
+                                // For ws, addr is only learned at register_pk time.
+                                // Keep this peer's live ws connection so the server
+                                // can later push PunchHole directly down it.
+                                if let Some(s) = sink.take() {
+                                    self.ws_map.lock().await.insert(try_into_v4(addr), s);
+                                }
+                            }
                             return true;
                         }
                     }
@@ -597,6 +610,7 @@ impl RendezvousServer {
         &mut self,
         rk: RegisterPk,
         addr: SocketAddr,
+        ws: bool,
     ) -> Result<register_pk_response::Result, register_pk_response::Result> {
         if rk.uuid.is_empty() || rk.pk.is_empty() {
             return Err(INVALID_ID_FORMAT);
@@ -677,7 +691,11 @@ impl RendezvousServer {
                 );
             }
         }
-        if changed {
+        if changed || ws {
+            // For ws peers the client stops re-sending register_pk once the key is
+            // confirmed and never sends register_peer over ws, so the only way to
+            // refresh last_reg_time (online status) is to update_pk on every ws
+            // register_pk. Without this the peer is reported OFFLINE after 30s.
             self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
         }
         Ok(register_pk_response::Result::OK)
@@ -1005,7 +1023,14 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+            // If the target peer is connected over WebSocket, it has no reachable
+            // UDP address; push the signaling straight down its live ws sink.
+            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
+            if sink.is_some() {
+                Self::send_to_sink(&mut sink, msg).await;
+            } else {
+                self.tx.send(Data::Msg(msg.into(), addr))?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1323,6 +1348,11 @@ impl RendezvousServer {
         }
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        }
+        if ws {
+            // Drop this connection's entry from the ws registry so we never push to
+            // a dead socket; the peer re-registers (and re-inserts) on reconnect.
+            self.ws_map.lock().await.remove(&try_into_v4(addr));
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())

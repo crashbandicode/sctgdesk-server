@@ -7,12 +7,41 @@ use hbbs::{common::*, *};
 use rocket::{
     config::LogLevel,
     data::{Limits, ToByteUnit},
+    fairing::{Fairing, Info, Kind},
+    http::{ContentType, Status},
+    Request, Response,
 };
 
 use std::thread;
 use sctgdesk_api_server::build_rocket;
 
 const RMEM: usize = 0;
+
+// The RustDesk client (Flutter) crashes with "Null check operator used on a null
+// value" when an auth failure on /api/login returns an empty body: it reads the
+// `error` field of what it assumes is a JSON object, and the body is empty.
+// This response fairing rewrites empty-bodied login 401s into a parseable JSON
+// error so the client shows a clean "wrong password" message instead of crashing.
+struct LoginErrorJson;
+
+#[rocket::async_trait]
+impl Fairing for LoginErrorJson {
+    fn info(&self) -> Info {
+        Info {
+            name: "JSON error body for /api/login auth failures",
+            kind: Kind::Response,
+        }
+    }
+
+    async fn on_response<'r>(&self, req: &'r Request<'_>, res: &mut Response<'r>) {
+        if res.status() == Status::Unauthorized && req.uri().path().as_str().ends_with("/login") {
+            let body = r#"{"error":"Wrong username or password."}"#;
+            res.set_status(Status::Unauthorized);
+            res.set_header(ContentType::JSON);
+            res.set_sized_body(body.len(), std::io::Cursor::new(body));
+        }
+    }
+}
 
 fn get_rocket_log_level() -> LogLevel {
     let log_level_env = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
@@ -37,7 +66,13 @@ async fn start_rocket() -> ResultType<()> {
         .merge(("secret_key", "wJq+s/xvwZjmMX3ev0p4gQTs9Ej5wt0brsk3ZGhoBTg="))
         .merge(("ident",  format!("SCTGDeskServer/{}", env!("CARGO_PKG_VERSION"))))
         .merge(("limits", Limits::new().limit("json", 2.mebibytes())));
-    let _rocket = build_rocket(figment).await.ignite().await?.launch().await;
+    let _rocket = build_rocket(figment)
+        .await
+        .attach(LoginErrorJson)
+        .ignite()
+        .await?
+        .launch()
+        .await;
     Ok(())
 }
 
