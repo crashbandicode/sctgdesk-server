@@ -1,0 +1,10 @@
+.git
+.github
+target
+**/target
+**/node_modules
+**/dist
+*.bundle
+*.log
+.cargo
+vendor/sctgdesk-api-server/.git

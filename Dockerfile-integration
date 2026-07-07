@@ -23,6 +23,10 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
     fi
 COPY src /build/src
 COPY libs /build/libs
+# Cargo.toml patches the API dependency to this vendored source. Keep it in the
+# Docker build context so container builds use the same reviewed code as local
+# builds instead of silently falling back to a remote revision.
+COPY vendor /build/vendor
 COPY Cargo.toml /build/Cargo.toml
 COPY Cargo.lock /build/Cargo.lock
 COPY build.rs /build/build.rs
@@ -33,7 +37,12 @@ RUN echo "INSERT OR IGNORE INTO peer (guid, id, uuid, pk, created_at, 'user', st
 # this workaround is needed because QEMU emulating 32 bits platfom on 64 bits host
 # see https://github.com/rust-lang/cargo/issues/8719
 RUN mv /root/.cargo /tmp && rm -rf /root/.cargo && mkdir -p /root/.cargo 
-RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
+RUN --mount=type=tmpfs,target=/root/.cargo \
+    --mount=type=cache,id=sctgdesk-cargo-registry,target=/root/.cargo/registry \
+    --mount=type=cache,id=sctgdesk-cargo-git,target=/root/.cargo/git \
+    --mount=type=cache,id=sctgdesk-cargo-target,target=/build/target \
+    --mount=type=cache,id=sctgdesk-npm,target=/root/.npm \
+    export TARGET=$(cat /build/_target) \
     && mkdir -p /root/.cargo \
     && cp -av /tmp/.cargo/* /root/.cargo/ && ls -lR /root/.cargo \
     && if [ ! -f /root/.cargo/config.toml ]; then \
@@ -41,9 +50,8 @@ RUN --mount=type=tmpfs,target=/root/.cargo export TARGET=$(cat /build/_target) \
     fi && \
     awk 'BEGIN{net_section=0;git_fetch_found=0;printed=0}/^\[net\]/{net_section=1;print;next}/^\[/{if(net_section&&!git_fetch_found){print "git-fetch-with-cli = true";printed=1}net_section=0;print;next}net_section&&/^git-fetch-with-cli\s*=/{print "git-fetch-with-cli = true";git_fetch_found=1;next}{print}END{if(!printed&&!git_fetch_found){if(!net_section)print "\n[net]";print "git-fetch-with-cli = true"}}' /root/.cargo/config.toml > /root/.cargo/config.tmp && \
     mv /root/.cargo/config.tmp /root/.cargo/config.toml \
-    && . /root/.cargo/env && cd /build \ 
-    && cargo update -p sctgdesk-api-server \
-    && DATABASE_URL=sqlite://$(pwd)/db_v2.sqlite3 cargo build --target=$TARGET --release || (echo "Build failed, entering sleep mode for debugging..." && cp -av /root/.cargo /build/ && exit 1) \
+    && . /root/.cargo/env && cd /build \
+    && DATABASE_URL=sqlite://$(pwd)/db_v2.sqlite3 cargo build --locked --target=$TARGET --release || (echo "Build failed, entering sleep mode for debugging..." && cp -av /root/.cargo /build/ && exit 1) \
     && mkdir -p /build/ubuntu-jammy/bin \
     && cp /build/target/$(cat /build/_target)/release/hbbr /build/ubuntu-jammy/bin/ \
     && cp /build/target/$(cat /build/_target)/release/hbbs /build/ubuntu-jammy/bin/ \
