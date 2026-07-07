@@ -68,4 +68,11 @@ hbb_common = { path = "libs/hbb_common" }
 
 [workspace]
 members = ["libs/hbb_common"]
-exclude = ["ui"]
+exclude = ["ui", "vendor"]
+
+# Use a locally-vendored copy of sctgdesk-api-server so we can persist API
+# access tokens to sqlite (they were previously in-memory only, so every hbbs
+# restart silently logged all clients out). Same commit as the git dep
+# (b5e300c), with libs/state modified.
+[patch."https://github.com/sctg-development/sctgdesk-api-server.git"]
+sctgdesk-api-server = { path = "vendor/sctgdesk-api-server" }

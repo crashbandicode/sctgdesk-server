@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:experimental
+# syntax=docker/dockerfile:1
 # Copyright 2024 SCTG Development - Ronan LE MEILLAT
 # SPDX-License-Identifier: AGPL-3.0-or-later
 FROM node:lts-bookworm AS builder
@@ -64,3 +64,9 @@ COPY --from=builder /build/ubuntu-jammy/bin/hbbs /usr/local/bin/hbbs
 COPY --from=builder /build/ubuntu-jammy/bin/oauth2.toml /usr/local/bin/oauth2.toml
 COPY --from=builder /build/ubuntu-jammy/bin/hbbr /usr/local/bin/hbbr
 COPY --from=builder /build/ubuntu-jammy/bin/rustdesk-utils /usr/local/bin/rustdesk-utils
+# hbbs/hbbr resolve their database (db_v2.sqlite3) and keypair (id_ed25519) via
+# RELATIVE paths. Without a WORKDIR the CWD is "/", so these land in the container's
+# ephemeral layer and reset on every recreate (admin password reverts to the seed,
+# address book/peers and the server key do not persist). Pin CWD to the data dir,
+# which is the documented persistent volume mount point, so all state persists.
+WORKDIR /usr/local/share/sctgdesk

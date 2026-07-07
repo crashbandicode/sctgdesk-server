@@ -1,8 +1,8 @@
-# crashbandicode patches (WebSocket peer presence + login error body)
+# crashbandicode patches (WS peer presence + login error body + state persistence)
 
-This fork carries two local patches on top of `sctg-development/sctgdesk-server`
+This fork carries local patches on top of `sctg-development/sctgdesk-server`
 so the server works correctly behind a reverse proxy / Cloudflare where clients
-connect over **WebSocket only** (no UDP).
+connect over **WebSocket only** (no UDP), and so runtime state actually persists.
 
 > No secrets live in this repo. The server keypair (`id_ed25519`), database
 > (`db_v2.sqlite3`), `.env`, and the `-k` license key are all supplied at run
@@ -33,6 +33,26 @@ then crashes with *"Null check operator used on a null value"* instead of showin
 "wrong password", because it parses the (missing) `error` field. A Rocket
 response fairing (`LoginErrorJson`) rewrites empty `401`s on `/api/login` into
 `{"error":"Wrong username or password."}`.
+
+### 3. `Dockerfile-integration` — `WORKDIR` so state persists
+The final image set **no `WORKDIR`**, so the container CWD was `/`. hbbs opens its
+database and keypair via relative paths (`./db_v2.sqlite3`, `./id_ed25519`), which
+therefore landed in `/` — the container's **ephemeral layer**, not the mounted
+`/usr/local/share/sctgdesk` volume. Every `docker compose ... --force-recreate`
+gave a fresh layer, so:
+- the admin password **reverted to the `Hello,world!` seed** on each recreate,
+- the modern address book (`ab`/`ab_peer` tables) and registered peers were lost,
+- the server kept generating a new `id_ed25519` (worked around earlier with `-k`).
+
+Fix: `WORKDIR /usr/local/share/sctgdesk` (the documented volume mount point) so all
+relative-path state is written to the persistent volume. The deployment compose
+also sets `working_dir: /usr/local/share/sctgdesk` on `hbbs`/`hbbr` as a belt-and-
+suspenders override that works even with an unpatched image (no rebuild needed).
+
+Note: the **legacy** `/api/ab` blob endpoint is in-memory only and never lands in
+`ab_legacy` upstream (separate sctgdesk bug), but modern desktop/Android clients
+use the new `/api/ab/peer/*` API which writes to `ab_peer` directly and now
+persists correctly.
 
 ## Build
 
