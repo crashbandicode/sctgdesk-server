@@ -55,7 +55,25 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i32 = 30_000;
+// WS clients (behind Cloudflare) only refresh their registration on the ~31s
+// reconnect cycle — they stop sending register_pk once the key is confirmed and
+// never send register_peer over ws. With a 30s window that leaves a recurring
+// dead gap each cycle where a live peer is falsely reported OFFLINE (punch) or
+// greyed out (online status), forcing the "retry / reopen the app" dance. Widen
+// to 90s so a peer must miss ~3 consecutive reconnects before it looks offline.
+const REG_TIMEOUT: i32 = 90_000;
+// How often the server sends an empty "heartbeat" frame to each live WebSocket
+// rendezvous connection. RustDesk ws clients stop sending register_pk once the
+// server key is confirmed and then rely entirely on the SERVER to send these
+// keepalives (which they echo back; see rustdesk rendezvous_mediator::start_tcp,
+// the `if bytes.is_empty() { ... continue; // heartbeat }` branch). Without a
+// server-side heartbeat the ws read loop below sees no traffic for its whole
+// read-timeout window and tears the socket down, so every ws client reconnects
+// on a fixed cadence (~30s) - a reconnect storm that leaves higher-latency/VPN
+// peers effectively unreachable (a connect request often lands mid-reconnect).
+// 15s gives multiple keepalives inside the read-timeout window and stays well
+// under Cloudflare's ~100s idle-websocket cutoff.
+const WS_HEARTBEAT_SECS: u64 = 15;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum SinkType {
@@ -233,6 +251,50 @@ impl RendezvousServer {
                 }
             });
         };
+        // DISABLED (again): server-push ws keepalive. Re-enabling this (2026-07-03,
+        // even with the per-send timeout below) starved the registration path within
+        // ~13h: this task holds the ws_map lock across every awaited send, and every
+        // register_pk / punch / relay / cleanup path also needs that same lock. Once
+        // enough half-open sinks accumulate (clients that slept / changed network),
+        // each tick spends up to 2s per stuck sink holding the lock, so the lock is
+        // held effectively continuously and NO new peer can register -> total connect
+        // outage (observed: 0 real registrations, rolled back to :prehb2). This is the
+        // second time a central heartbeat took down connects (see :hb-broken image).
+        // The ~64s reconnect churn from the read timeout is harmless (connects still
+        // work), so it stays. A correct keepalive must NOT hold ws_map across sends:
+        // e.g. spawn a per-connection ping from the read loop, or snapshot+send
+        // without the global lock. Leave off until redesigned and load-tested.
+        if false {
+            let ws_map = rs.ws_map.clone();
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(WS_HEARTBEAT_SECS));
+                ticker.tick().await; // discard the immediate first tick
+                loop {
+                    ticker.tick().await;
+                    let mut map = ws_map.lock().await;
+                    if map.is_empty() {
+                        continue;
+                    }
+                    let mut dead: Vec<SocketAddr> = Vec::new();
+                    for (addr, sink) in map.iter_mut() {
+                        if let SinkType::Ws(ws) = &mut sink.tx {
+                            match timeout(
+                                2_000,
+                                ws.send(tungstenite::Message::Binary(Vec::new())),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                _ => dead.push(*addr),
+                            }
+                        }
+                    }
+                    for addr in dead {
+                        map.remove(&addr);
+                    }
+                }
+            });
+        }
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -487,18 +549,27 @@ impl RendezvousServer {
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
                         rf.socket_addr = AddrMangle::encode(addr).into();
+                        let relay = rf.relay_server.clone();
+                        let rid = rf.id.clone();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        log::info!(
+                            "[ICE] RequestRelay id={:?} relay_server='{}' from {:?} -> peer {:?}",
+                            rid, relay, addr, peer_addr
+                        );
+                        // ws peers can't be reached over UDP; deliver via ws sink.
+                        allow_err!(self.push_to_peer(peer_addr, msg_out).await);
+                    } else {
+                        log::info!("[ICE] RequestRelay id={:?} but peer not in memory", rf.id);
                     }
                     return true;
                 }
                 Some(rendezvous_message::Union::RelayResponse(mut rr)) => {
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
                     rr.socket_addr = Default::default();
-                    let id = rr.id();
+                    let id = rr.id().to_owned();
                     if !id.is_empty() {
-                        let pk = self.get_pk(&rr.version, id.to_owned()).await;
+                        let pk = self.get_pk(&rr.version, id.clone()).await;
                         rr.set_pk(pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
@@ -510,6 +581,10 @@ impl RendezvousServer {
                             rr.relay_server = self.get_relay_server(addr.ip(), addr_b.ip());
                         }
                     }
+                    log::info!(
+                        "[ICE] RelayResponse id={:?} relay_server='{}' from {:?} -> initiator {:?}",
+                        id, rr.relay_server, addr, addr_b
+                    );
                     msg_out.set_relay_response(rr);
                     allow_err!(self.send_to_tcp_sync(msg_out, addr_b).await);
                 }
@@ -760,6 +835,13 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
+        log::info!(
+            "[ICE] punch_hole_sent (B->A) ice_srflx='{}' nat_type={:?} relay_server='{}' to {:?}",
+            phs.ice_srflx,
+            phs.nat_type.enum_value(),
+            phs.relay_server,
+            &addr_a
+        );
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -925,6 +1007,12 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             } else {
+                log::info!(
+                    "[ICE] punch_hole_request id={:?} ice_srflx='{}' from {:?}",
+                    id,
+                    ph.ice_srflx,
+                    addr
+                );
                 log::debug!(
                     "Punch hole {:?} {:?} request from {:?}",
                     id,
@@ -1019,6 +1107,31 @@ impl RendezvousServer {
         Ok(())
     }
 
+    // Deliver a signaling message to a peer, preferring its live ws sink.
+    //
+    // ws peers (behind Cloudflare/Traefik) have no UDP-reachable address, so the
+    // only way to reach them is the sink stored in ws_map at register time. We
+    // temporarily take the sink out, send, then RE-INSERT it so the peer stays
+    // reachable for follow-up pushes within the same connect attempt. This is
+    // essential for relay-only peers (symmetric NAT / VPN): after the initial
+    // PunchHole they still need to receive RequestRelay, and previously the sink
+    // was consumed by the first push and the peer went silent until its next
+    // 31s reconnect. Non-ws peers fall back to the UDP rendezvous channel.
+    #[inline]
+    async fn push_to_peer(&self, peer_addr: SocketAddr, msg: RendezvousMessage) -> ResultType<()> {
+        let key = try_into_v4(peer_addr);
+        let mut sink = self.ws_map.lock().await.remove(&key);
+        if sink.is_some() {
+            Self::send_to_sink(&mut sink, msg).await;
+            if let Some(s) = sink {
+                self.ws_map.lock().await.insert(key, s);
+            }
+        } else {
+            self.tx.send(Data::Msg(msg.into(), peer_addr))?;
+        }
+        Ok(())
+    }
+
     #[inline]
     async fn handle_tcp_punch_hole_request(
         &mut self,
@@ -1028,15 +1141,10 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(addr) = to_addr {
-            // If the target peer is connected over WebSocket, it has no reachable
-            // UDP address; push the signaling straight down its live ws sink.
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if sink.is_some() {
-                Self::send_to_sink(&mut sink, msg).await;
-            } else {
-                self.tx.send(Data::Msg(msg.into(), addr))?;
-            }
+        if let Some(peer_addr) = to_addr {
+            // Push straight down the peer's live ws sink (re-armed for retries and
+            // the follow-up relay handshake), falling back to UDP for non-ws peers.
+            self.push_to_peer(peer_addr, msg).await?;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1317,8 +1425,17 @@ impl RendezvousServer {
                 tx: SinkType::Ws(a),
                 key: Arc::new(Mutex::new(None)),
             });
-            while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
+            // Read timeout is comfortably larger than WS_HEARTBEAT_SECS so a
+            // single delayed/dropped heartbeat echo (e.g. a VPN latency spike)
+            // does not tear down an otherwise-healthy connection.
+            while let Ok(Some(Ok(msg))) = timeout(60_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
+                    // Empty frame = the client's echo of our heartbeat. It has
+                    // already reset the read timeout by arriving; nothing else
+                    // to do (parsing it as protobuf would just be a no-op).
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
                     }

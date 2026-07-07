@@ -1,7 +1,7 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
 use hbb_common::{
-    allow_err, bail,
+    allow_err,
     bytes::{Bytes, BytesMut},
     futures_util::{sink::SinkExt, stream::StreamExt},
     log,
@@ -471,49 +471,86 @@ async fn relay(
         (sb * DOWNGRADE_THRESHOLD_100.load(Ordering::SeqCst) as f64 / 100. / 1000.) as usize; // in bit/ms
     let mut timer = interval(Duration::from_secs(3));
     let mut last_recv_time = std::time::Instant::now();
+    // [RELAYDIAG] session-scoped instrumentation to pin why relayed sessions to a
+    // VPN'd peer drop at irregular intervals. Records which side closed, whether it
+    // was a clean WS close vs a network error (RST/timeout), the exact error, the
+    // session duration, and byte volume each way (the bigger sender is the
+    // controlled/Yoga video stream). None of this changes relay behavior.
+    let session_start = std::time::Instant::now();
+    let mut bytes_p2s: u64 = 0;
+    let mut bytes_s2p: u64 = 0;
+    let mut close_reason = String::from("loop-exit");
     loop {
         tokio::select! {
             res = peer.recv() => {
-                if let Some(Ok(bytes)) = res {
-                    last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
-                    if blacked || downgrade {
-                        blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
+                match res {
+                    Some(Ok(bytes)) => {
+                        last_recv_time = std::time::Instant::now();
+                        let nb = bytes.len() * 8;
+                        bytes_p2s += bytes.len() as u64;
+                        if blacked || downgrade {
+                            blacklist_limiter.consume(nb).await;
+                        } else {
+                            limiter.consume(nb).await;
+                        }
+                        total_limiter.consume(nb).await;
+                        total += nb;
+                        total_s += nb;
+                        if !bytes.is_empty() {
+                            if let Err(e) = stream.send_raw(bytes.into()).await {
+                                close_reason = format!("send peer->initiator FAILED: {}", e);
+                                break;
+                            }
+                        }
                     }
-                    total_limiter.consume(nb).await;
-                    total += nb;
-                    total_s += nb;
-                    if !bytes.is_empty() {
-                        stream.send_raw(bytes.into()).await?;
+                    Some(Err(e)) => {
+                        close_reason = format!("peer(first-connected) recv ERR: {}", e);
+                        break;
                     }
-                } else {
-                    break;
+                    None => {
+                        close_reason = "peer(first-connected) recv None (clean WS close)".to_string();
+                        break;
+                    }
                 }
             },
             res = stream.recv() => {
-                if let Some(Ok(bytes)) = res {
-                    last_recv_time = std::time::Instant::now();
-                    let nb = bytes.len() * 8;
-                    if blacked || downgrade {
-                        blacklist_limiter.consume(nb).await;
-                    } else {
-                        limiter.consume(nb).await;
+                match res {
+                    Some(Ok(bytes)) => {
+                        last_recv_time = std::time::Instant::now();
+                        let nb = bytes.len() * 8;
+                        bytes_s2p += bytes.len() as u64;
+                        if blacked || downgrade {
+                            blacklist_limiter.consume(nb).await;
+                        } else {
+                            limiter.consume(nb).await;
+                        }
+                        total_limiter.consume(nb).await;
+                        total += nb;
+                        total_s += nb;
+                        if !bytes.is_empty() {
+                            if let Err(e) = peer.send_raw(bytes.into()).await {
+                                close_reason = format!("send initiator->peer FAILED: {}", e);
+                                break;
+                            }
+                        }
                     }
-                    total_limiter.consume(nb).await;
-                    total += nb;
-                    total_s += nb;
-                    if !bytes.is_empty() {
-                        peer.send_raw(bytes.into()).await?;
+                    Some(Err(e)) => {
+                        close_reason = format!("stream(initiator) recv ERR: {}", e);
+                        break;
                     }
-                } else {
-                    break;
+                    None => {
+                        close_reason = "stream(initiator) recv None (clean WS close)".to_string();
+                        break;
+                    }
                 }
             },
             _ = timer.tick() => {
                 if last_recv_time.elapsed().as_secs() > 30 {
-                    bail!("Timeout");
+                    close_reason = format!(
+                        "30s idle timeout (no bytes for {}s)",
+                        last_recv_time.elapsed().as_secs()
+                    );
+                    break;
                 }
             }
         }
@@ -550,6 +587,14 @@ async fn relay(
             }
         }
     }
+    log::info!(
+        "[RELAYDIAG] {} closed after {:.1}s | reason={} | peer->initiator={} bytes, initiator->peer={} bytes (bigger sender = controlled/Yoga video)",
+        addr,
+        session_start.elapsed().as_secs_f64(),
+        close_reason,
+        bytes_p2s,
+        bytes_s2p
+    );
     Ok(())
 }
 
