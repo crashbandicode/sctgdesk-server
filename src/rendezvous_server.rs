@@ -55,6 +55,36 @@ enum Data {
     RelayServers(RelayServers),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PeerTarget {
+    addr: SocketAddr,
+    is_ws: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerDeliveryRoute {
+    WebSocket,
+    Udp,
+    StaleWebSocket,
+}
+
+fn peer_delivery_route(is_ws: bool, has_ws_sink: bool) -> PeerDeliveryRoute {
+    match (is_ws, has_ws_sink) {
+        (_, true) => PeerDeliveryRoute::WebSocket,
+        (true, false) => PeerDeliveryRoute::StaleWebSocket,
+        (false, false) => PeerDeliveryRoute::Udp,
+    }
+}
+
+fn offline_response() -> RendezvousMessage {
+    let mut message = RendezvousMessage::new();
+    message.set_punch_hole_response(PunchHoleResponse {
+        failure: punch_hole_response::Failure::OFFLINE.into(),
+        ..Default::default()
+    });
+    message
+}
+
 // WS clients (behind Cloudflare) only refresh their registration on the ~31s
 // reconnect cycle — they stop sending register_pk once the key is confirmed and
 // never send register_peer over ws. With a 30s window that leaves a recurring
@@ -74,8 +104,15 @@ const REG_TIMEOUT: i32 = 90_000;
 // 15s gives multiple keepalives inside the read-timeout window and stays well
 // under Cloudflare's ~100s idle-websocket cutoff.
 const WS_HEARTBEAT_SECS: u64 = 15;
+// Heartbeats are written by a per-connection task and echoed by supported
+// clients. Keep a generous watchdog above the observed ~91.5s registration
+// renewal interval so a delayed echo or renewal never creates a dead window.
+const WS_READ_TIMEOUT_SECS: u64 = 120;
+const WS_SEND_TIMEOUT_MILLIS: u64 = 2_000;
+const WS_OUTBOUND_CAPACITY: usize = 32;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
-type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+type WsStreamSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
+type WsSink = mpsc::Sender<tungstenite::Message>;
 enum SinkType {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
@@ -139,7 +176,10 @@ pub struct RendezvousServer {
     // Persistent registry of live WebSocket peer sinks, keyed by their connection
     // address. Required so the server can push PunchHole/relay signaling down a
     // ws peer's existing outbound connection (ws/Cloudflare clients have no UDP).
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    ws_map: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Sink>>>>>,
+    // Maps a live ws connection back to its peer ID so heartbeat echoes can
+    // refresh last_reg_time without scanning the entire peer map.
+    ws_peers: Arc<Mutex<HashMap<SocketAddr, String>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -190,6 +230,7 @@ impl RendezvousServer {
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             ws_map: Arc::new(Mutex::new(HashMap::new())),
+            ws_peers: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -251,50 +292,10 @@ impl RendezvousServer {
                 }
             });
         };
-        // DISABLED (again): server-push ws keepalive. Re-enabling this (2026-07-03,
-        // even with the per-send timeout below) starved the registration path within
-        // ~13h: this task holds the ws_map lock across every awaited send, and every
-        // register_pk / punch / relay / cleanup path also needs that same lock. Once
-        // enough half-open sinks accumulate (clients that slept / changed network),
-        // each tick spends up to 2s per stuck sink holding the lock, so the lock is
-        // held effectively continuously and NO new peer can register -> total connect
-        // outage (observed: 0 real registrations, rolled back to :prehb2). This is the
-        // second time a central heartbeat took down connects (see :hb-broken image).
-        // The ~64s reconnect churn from the read timeout is harmless (connects still
-        // work), so it stays. A correct keepalive must NOT hold ws_map across sends:
-        // e.g. spawn a per-connection ping from the read loop, or snapshot+send
-        // without the global lock. Leave off until redesigned and load-tested.
-        if false {
-            let ws_map = rs.ws_map.clone();
-            tokio::spawn(async move {
-                let mut ticker = interval(Duration::from_secs(WS_HEARTBEAT_SECS));
-                ticker.tick().await; // discard the immediate first tick
-                loop {
-                    ticker.tick().await;
-                    let mut map = ws_map.lock().await;
-                    if map.is_empty() {
-                        continue;
-                    }
-                    let mut dead: Vec<SocketAddr> = Vec::new();
-                    for (addr, sink) in map.iter_mut() {
-                        if let SinkType::Ws(ws) = &mut sink.tx {
-                            match timeout(
-                                2_000,
-                                ws.send(tungstenite::Message::Binary(Vec::new())),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                _ => dead.push(*addr),
-                            }
-                        }
-                    }
-                    for addr in dead {
-                        map.remove(&addr);
-                    }
-                }
-            });
-        }
+        // WebSocket keepalives are deliberately per connection in
+        // handle_listener_inner. Never reintroduce a central task that holds
+        // ws_map while awaiting network I/O; that design caused lock starvation
+        // and a total registration outage when half-open sockets accumulated.
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -552,15 +553,27 @@ impl RendezvousServer {
                         let relay = rf.relay_server.clone();
                         let rid = rf.id.clone();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
+                        let target = {
+                            let peer = peer.read().await;
+                            PeerTarget {
+                                addr: peer.socket_addr,
+                                is_ws: peer.is_ws,
+                            }
+                        };
                         log::info!(
                             "[ICE] RequestRelay id={:?} relay_server='{}' from {:?} -> peer {:?}",
-                            rid, relay, addr, peer_addr
+                            rid, relay, addr, target.addr
                         );
-                        // ws peers can't be reached over UDP; deliver via ws sink.
-                        allow_err!(self.push_to_peer(peer_addr, msg_out).await);
+                        if !self.push_to_peer(target, msg_out).await.unwrap_or(false) {
+                            log::warn!(
+                                "[ICE] RequestRelay id={:?} has no live ws sink; replying OFFLINE",
+                                rid
+                            );
+                            self.send_to_tcp_sync(offline_response(), addr).await.ok();
+                        }
                     } else {
                         log::info!("[ICE] RequestRelay id={:?} but peer not in memory", rf.id);
+                        self.send_to_tcp_sync(offline_response(), addr).await.ok();
                     }
                     return true;
                 }
@@ -610,6 +623,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let ws_peer_id = if ws { Some(rk.id.clone()) } else { None };
                     let response = self.handle_register_pk(rk, addr, ws).await;
                     match response {
                         Err(err) => {
@@ -633,7 +647,16 @@ impl RendezvousServer {
                                 // Keep this peer's live ws connection so the server
                                 // can later push PunchHole directly down it.
                                 if let Some(s) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), s);
+                                    self.ws_map
+                                        .lock()
+                                        .await
+                                        .insert(try_into_v4(addr), Arc::new(Mutex::new(s)));
+                                }
+                                if let Some(id) = ws_peer_id {
+                                    self.ws_peers
+                                        .lock()
+                                        .await
+                                        .insert(try_into_v4(addr), id);
                                 }
                             }
                             return true;
@@ -771,7 +794,19 @@ impl RendezvousServer {
             // confirmed and never sends register_peer over ws, so the only way to
             // refresh last_reg_time (online status) is to update_pk on every ws
             // register_pk. Without this the peer is reported OFFLINE after 30s.
-            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+            self.pm
+                .update_pk(
+                    id,
+                    peer,
+                    PeerRegistration {
+                        addr,
+                        uuid: rk.uuid,
+                        pk: rk.pk,
+                        ip,
+                        is_ws: ws,
+                    },
+                )
+                .await;
         }
         Ok(register_pk_response::Result::OK)
         // let mut msg_out = RendezvousMessage::new();
@@ -800,6 +835,7 @@ impl RendezvousServer {
             let request_pk = old.pk.is_empty() || ip_change;
             if !request_pk {
                 old.socket_addr = socket_addr;
+                old.is_ws = false;
                 old.last_reg_time = Instant::now();
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
@@ -909,7 +945,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<PeerTarget>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             let mut msg_out = RendezvousMessage::new();
@@ -962,9 +998,13 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr) = {
+            let (elapsed, peer_addr, peer_is_ws) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                (
+                    r.last_reg_time.elapsed().as_millis() as i32,
+                    r.socket_addr,
+                    r.is_ws,
+                )
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -1029,7 +1069,13 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            Ok((
+                msg_out,
+                Some(PeerTarget {
+                    addr: peer_addr,
+                    is_ws: peer_is_ws,
+                }),
+            ))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1078,21 +1124,27 @@ impl RendezvousServer {
     }
 
     #[inline]
-    async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
-        if let Some(sink) = sink.as_mut() {
-            if let Ok(mut bytes) = msg.write_to_bytes() {
-                if let Some(enc) = &mut sink.key.lock().await.as_mut() {
-                    bytes = enc.enc(&bytes);
-                }
-                match &mut sink.tx {
-                    SinkType::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
-                    }
-                    SinkType::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
-                    }
-                }
-            }
+    async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) -> bool {
+        let Some(sink) = sink.as_mut() else {
+            return false;
+        };
+        Self::send_via_sink(sink, msg).await
+    }
+
+    #[inline]
+    async fn send_via_sink(sink: &mut Sink, msg: RendezvousMessage) -> bool {
+        let Ok(mut bytes) = msg.write_to_bytes() else {
+            return false;
+        };
+        if let Some(enc) = &mut sink.key.lock().await.as_mut() {
+            bytes = enc.enc(&bytes);
+        }
+        match &mut sink.tx {
+            SinkType::TcpStream(s) => s.send(Bytes::from(bytes)).await.is_ok(),
+            SinkType::Ws(ws) => ws
+                .send(tungstenite::Message::Binary(bytes))
+                .await
+                .is_ok(),
         }
     }
 
@@ -1107,29 +1159,56 @@ impl RendezvousServer {
         Ok(())
     }
 
-    // Deliver a signaling message to a peer, preferring its live ws sink.
+    // Deliver a signaling message using the transport on which the peer most
+    // recently registered.
     //
     // ws peers (behind Cloudflare/Traefik) have no UDP-reachable address, so the
-    // only way to reach them is the sink stored in ws_map at register time. We
-    // temporarily take the sink out, send, then RE-INSERT it so the peer stays
-    // reachable for follow-up pushes within the same connect attempt. This is
-    // essential for relay-only peers (symmetric NAT / VPN): after the initial
-    // PunchHole they still need to receive RequestRelay, and previously the sink
-    // was consumed by the first push and the peer went silent until its next
-    // 31s reconnect. Non-ws peers fall back to the UDP rendezvous channel.
+    // only way to reach them is the sink stored in ws_map at register time. The
+    // map stores a stable per-connection handle, so concurrent pushes never
+    // temporarily remove a healthy peer and each connection serializes its own
+    // writes without holding the global map lock over I/O. A known ws peer with
+    // no live sink is stale: never send its signaling to the reverse proxy's
+    // source address as UDP because that packet cannot reach the client and
+    // leaves the initiator spinning.
     #[inline]
-    async fn push_to_peer(&self, peer_addr: SocketAddr, msg: RendezvousMessage) -> ResultType<()> {
-        let key = try_into_v4(peer_addr);
-        let mut sink = self.ws_map.lock().await.remove(&key);
-        if sink.is_some() {
-            Self::send_to_sink(&mut sink, msg).await;
-            if let Some(s) = sink {
-                self.ws_map.lock().await.insert(key, s);
+    async fn push_to_peer(&self, target: PeerTarget, msg: RendezvousMessage) -> ResultType<bool> {
+        let key = try_into_v4(target.addr);
+        let sink = self.ws_map.lock().await.get(&key).cloned();
+        match peer_delivery_route(target.is_ws, sink.is_some()) {
+            PeerDeliveryRoute::WebSocket => {
+                let sink = sink.expect("WebSocket route requires a registered sink");
+                let delivered = {
+                    let mut sink = sink.lock().await;
+                    Self::send_via_sink(&mut sink, msg).await
+                };
+                if !delivered {
+                    let mut ws_map = self.ws_map.lock().await;
+                    let removed_current = ws_map
+                        .get(&key)
+                        .map(|current| Arc::ptr_eq(current, &sink))
+                        .unwrap_or(false);
+                    if removed_current {
+                        ws_map.remove(&key);
+                    }
+                    drop(ws_map);
+                    if removed_current {
+                        self.ws_peers.lock().await.remove(&key);
+                    }
+                }
+                Ok(delivered)
             }
-        } else {
-            self.tx.send(Data::Msg(msg.into(), peer_addr))?;
+            PeerDeliveryRoute::StaleWebSocket => {
+                log::warn!(
+                    "Refusing UDP fallback for stale WebSocket peer {:?}",
+                    target.addr
+                );
+                Ok(false)
+            }
+            PeerDeliveryRoute::Udp => {
+                self.tx.send(Data::Msg(msg.into(), target.addr))?;
+                Ok(true)
+            }
         }
-        Ok(())
     }
 
     #[inline]
@@ -1141,10 +1220,10 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
-        if let Some(peer_addr) = to_addr {
-            // Push straight down the peer's live ws sink (re-armed for retries and
-            // the follow-up relay handshake), falling back to UDP for non-ws peers.
-            self.push_to_peer(peer_addr, msg).await?;
+        if let Some(target) = to_addr {
+            if !self.push_to_peer(target, msg).await? {
+                self.send_to_tcp_sync(offline_response(), addr).await?;
+            }
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1159,13 +1238,13 @@ impl RendezvousServer {
         key: &str,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        if let Some(target) = to_addr {
+            if !self.push_to_peer(target, msg).await? {
+                self.tx.send(Data::Msg(offline_response().into(), addr))?;
+            }
+        } else {
+            self.tx.send(Data::Msg(msg.into(), addr))?;
+        }
         Ok(())
     }
 
@@ -1370,7 +1449,7 @@ impl RendezvousServer {
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                         let res = rs.check_cmd(data).await;
-                        stream.write(res.as_bytes()).await.ok();
+                        stream.write_all(res.as_bytes()).await.ok();
                     }
                 }
             });
@@ -1409,6 +1488,26 @@ impl RendezvousServer {
         });
     }
 
+    async fn run_ws_writer(
+        mut writer: WsStreamSink,
+        mut messages: mpsc::Receiver<tungstenite::Message>,
+        addr: SocketAddr,
+    ) {
+        while let Some(message) = messages.recv().await {
+            match timeout(WS_SEND_TIMEOUT_MILLIS, writer.send(message)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    log::debug!("WebSocket writer for {:?} closed: {}", addr, error);
+                    break;
+                }
+                Err(_) => {
+                    log::warn!("WebSocket writer for {:?} timed out", addr);
+                    break;
+                }
+            }
+        }
+    }
+
     #[inline]
     async fn handle_listener_inner(
         &mut self,
@@ -1418,26 +1517,74 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let mut sink;
+        let mut ws_connection = None;
         if ws {
             let ws_stream = tokio_tungstenite::accept_async(stream).await?;
-            let (a, mut b) = ws_stream.split();
+            let (writer, mut reader) = ws_stream.split();
+            let (ws_tx, ws_rx) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+            tokio::spawn(Self::run_ws_writer(writer, ws_rx, addr));
+            let heartbeat_tx = ws_tx.clone();
+            ws_connection = Some(ws_tx.clone());
             sink = Some(Sink {
-                tx: SinkType::Ws(a),
+                tx: SinkType::Ws(ws_tx),
                 key: Arc::new(Mutex::new(None)),
             });
-            // Read timeout is comfortably larger than WS_HEARTBEAT_SECS so a
-            // single delayed/dropped heartbeat echo (e.g. a VPN latency spike)
-            // does not tear down an otherwise-healthy connection.
-            while let Ok(Some(Ok(msg))) = timeout(60_000, b.next()).await {
-                if let tungstenite::Message::Binary(bytes) = msg {
-                    // Empty frame = the client's echo of our heartbeat. It has
-                    // already reset the read timeout by arriving; nothing else
-                    // to do (parsing it as protobuf would just be a no-op).
-                    if bytes.is_empty() {
-                        continue;
+            let mut heartbeat = interval(Duration::from_secs(WS_HEARTBEAT_SECS));
+            heartbeat.tick().await; // discard interval's immediate first tick
+            let mut last_inbound = Instant::now();
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        if last_inbound.elapsed() >= Duration::from_secs(WS_READ_TIMEOUT_SECS) {
+                            log::warn!(
+                                "WebSocket connection from {:?} exceeded the {}s read watchdog",
+                                addr,
+                                WS_READ_TIMEOUT_SECS
+                            );
+                            break;
+                        }
+                        if heartbeat_tx
+                            .send(tungstenite::Message::Binary(Vec::new()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
-                        break;
+                    _ = heartbeat_tx.closed() => break,
+                    incoming = reader.next() => {
+                        let Some(incoming) = incoming else {
+                            break;
+                        };
+                        let msg = match incoming {
+                            Ok(msg) => msg,
+                            Err(error) => {
+                                log::debug!("WebSocket reader for {:?} closed: {}", addr, error);
+                                break;
+                            }
+                        };
+                        last_inbound = Instant::now();
+                        if let tungstenite::Message::Binary(bytes) = msg {
+                            // Empty frame is the client's heartbeat echo. Refresh
+                            // only the peer currently associated with this socket.
+                            if bytes.is_empty() {
+                                let peer_id = self
+                                    .ws_peers
+                                    .lock()
+                                    .await
+                                    .get(&try_into_v4(addr))
+                                    .cloned();
+                                if let Some(peer_id) = peer_id {
+                                    self.pm.touch_ws(&peer_id, addr).await;
+                                }
+                                continue;
+                            }
+                            if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                                break;
+                            }
+                        } else if msg.is_close() {
+                            break;
+                        }
                     }
                 }
             }
@@ -1472,10 +1619,34 @@ impl RendezvousServer {
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
-        if ws {
-            // Drop this connection's entry from the ws registry so we never push to
-            // a dead socket; the peer re-registers (and re-inserts) on reconnect.
-            self.ws_map.lock().await.remove(&try_into_v4(addr));
+        if let Some(ws_connection) = ws_connection {
+            // Remove only this connection's registration. A reverse proxy can
+            // reuse a source socket quickly, so late cleanup from the old task
+            // must not delete a replacement connection that already registered.
+            let key = try_into_v4(addr);
+            let registered = self.ws_map.lock().await.get(&key).cloned();
+            let is_current = if let Some(registered) = registered.as_ref() {
+                let registered = registered.lock().await;
+                matches!(
+                    &registered.tx,
+                    SinkType::Ws(sender) if sender.same_channel(&ws_connection)
+                )
+            } else {
+                false
+            };
+            if is_current {
+                let mut ws_map = self.ws_map.lock().await;
+                if ws_map
+                    .get(&key)
+                    .zip(registered.as_ref())
+                    .map(|(current, registered)| Arc::ptr_eq(current, registered))
+                    .unwrap_or(false)
+                {
+                    ws_map.remove(&key);
+                    drop(ws_map);
+                    self.ws_peers.lock().await.remove(&key);
+                }
+            }
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
@@ -1678,5 +1849,23 @@ fn get_symetric_key_from_msg(
             key_array
         }
         Err(e) => panic!("Error while opening the seal key{:?}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_peer_without_sink_never_falls_back_to_udp() {
+        assert_eq!(
+            peer_delivery_route(true, false),
+            PeerDeliveryRoute::StaleWebSocket
+        );
+        assert_eq!(
+            peer_delivery_route(true, true),
+            PeerDeliveryRoute::WebSocket
+        );
+        assert_eq!(peer_delivery_route(false, false), PeerDeliveryRoute::Udp);
     }
 }

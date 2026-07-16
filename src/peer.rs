@@ -29,8 +29,17 @@ pub(crate) struct PeerInfo {
     pub(crate) ip: String,
 }
 
+pub(crate) struct PeerRegistration {
+    pub(crate) addr: SocketAddr,
+    pub(crate) uuid: Bytes,
+    pub(crate) pk: Bytes,
+    pub(crate) ip: String,
+    pub(crate) is_ws: bool,
+}
+
 pub(crate) struct Peer {
     pub(crate) socket_addr: SocketAddr,
+    pub(crate) is_ws: bool,
     pub(crate) last_reg_time: Instant,
     pub(crate) guid: Vec<u8>,
     pub(crate) uuid: Bytes,
@@ -45,6 +54,7 @@ impl Default for Peer {
     fn default() -> Self {
         Self {
             socket_addr: "0.0.0.0:0".parse().unwrap(),
+            is_ws: false,
             last_reg_time: get_expired_time(),
             guid: Vec::new(),
             uuid: Bytes::new(),
@@ -94,15 +104,20 @@ impl PeerMap {
         &mut self,
         id: String,
         peer: LockPeer,
-        addr: SocketAddr,
-        uuid: Bytes,
-        pk: Bytes,
-        ip: String,
+        registration: PeerRegistration,
     ) -> register_pk_response::Result {
+        let PeerRegistration {
+            addr,
+            uuid,
+            pk,
+            ip,
+            is_ws,
+        } = registration;
         log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
         let (info_str, guid) = {
             let mut w = peer.write().await;
             w.socket_addr = addr;
+            w.is_ws = is_ws;
             w.uuid = uuid.clone();
             w.pk = pk.clone();
             w.last_reg_time = Instant::now();
@@ -130,6 +145,22 @@ impl PeerMap {
             log::info!("pk updated instead of insert");
         }
         register_pk_response::Result::OK
+    }
+
+    /// Refresh a WebSocket registration only when this is still the peer's
+    /// current connection. A late heartbeat from a superseded socket must not
+    /// make an old address look live again.
+    #[inline]
+    pub(crate) async fn touch_ws(&self, id: &str, addr: SocketAddr) -> bool {
+        let Some(peer) = self.get_in_memory(id).await else {
+            return false;
+        };
+        let mut peer = peer.write().await;
+        if !peer.is_ws || peer.socket_addr != addr {
+            return false;
+        }
+        peer.last_reg_time = Instant::now();
+        true
     }
 
     #[inline]
