@@ -622,6 +622,11 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
+                Some(rendezvous_message::Union::OnlineRequest(or)) => {
+                    let msg_out = self.online_response(or.peers).await;
+                    Self::send_to_sink(sink, msg_out).await;
+                    return true;
+                }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     let ws_peer_id = if ws { Some(rk.id.clone()) } else { None };
                     let response = self.handle_register_pk(rk, addr, ws).await;
@@ -1092,6 +1097,13 @@ impl RendezvousServer {
         stream: &mut FramedStream,
         peers: Vec<String>,
     ) -> ResultType<()> {
+        let msg_out = self.online_response(peers).await;
+        stream.send(&msg_out).await?;
+
+        Ok(())
+    }
+
+    async fn online_response(&self, peers: Vec<String>) -> RendezvousMessage {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
@@ -1110,9 +1122,7 @@ impl RendezvousServer {
             states: states.into(),
             ..Default::default()
         });
-        stream.send(&msg_out).await?;
-
-        Ok(())
+        msg_out
     }
 
     #[inline]
@@ -1867,5 +1877,79 @@ mod tests {
             PeerDeliveryRoute::WebSocket
         );
         assert_eq!(peer_delivery_route(false, false), PeerDeliveryRoute::Udp);
+    }
+
+    #[tokio::test]
+    async fn websocket_online_request_receives_response() {
+        let db_path = std::env::temp_dir().join(format!(
+            "sctgdesk-online-request-{}-{}.sqlite3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("DB_URL", &db_path);
+        let pm = PeerMap::new().await.unwrap();
+        std::env::remove_var("DB_URL");
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (secure_tcp_pk_b, secure_tcp_sk_b) = box_::gen_keypair();
+        let mut server = RendezvousServer {
+            tcp_punch: Default::default(),
+            ws_map: Default::default(),
+            ws_peers: Default::default(),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Default::default(),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: None,
+                secure_tcp_pk_b,
+                secure_tcp_sk_b,
+            }),
+        };
+
+        let (ws_tx, mut ws_rx) = mpsc::channel(1);
+        let mut sink = Some(Sink {
+            tx: SinkType::Ws(ws_tx),
+            key: Default::default(),
+        });
+        let mut request = RendezvousMessage::new();
+        request.set_online_request(OnlineRequest {
+            peers: vec!["missing-peer".to_owned()],
+            ..Default::default()
+        });
+
+        assert!(
+            server
+                .handle_tcp(
+                    &request.write_to_bytes().unwrap(),
+                    &mut sink,
+                    "127.0.0.1:12345".parse().unwrap(),
+                    "",
+                    true,
+                )
+                .await
+        );
+
+        let response = ws_rx.recv().await.unwrap();
+        let tungstenite::Message::Binary(response) = response else {
+            panic!("online response was not a binary WebSocket frame");
+        };
+        let response = RendezvousMessage::parse_from_bytes(&response).unwrap();
+        let Some(rendezvous_message::Union::OnlineResponse(response)) = response.union else {
+            panic!("online request did not receive an online response");
+        };
+        assert_eq!(response.states, Bytes::from_static(&[0]));
+
+        drop(server);
+        std::fs::remove_file(db_path).ok();
     }
 }
