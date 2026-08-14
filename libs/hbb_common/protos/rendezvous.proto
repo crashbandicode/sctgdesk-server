@@ -21,8 +21,12 @@ message PunchHoleRequest {
   string licence_key = 3;
   ConnType conn_type = 4;
   string token = 5;
+  // Upstream reserves field 11 for switch-code handoff. Keep the server's
+  // decoder wire-compatible with current clients even though this fork does
+  // not otherwise consume the value yet.
+  string switch_code = 11;
   // [ICE experiment] initiator's server-reflexive candidate "ip:port" from public STUN.
-  string ice_srflx = 11;
+  string ice_srflx = 12;
 }
 
 message PunchHole { 
