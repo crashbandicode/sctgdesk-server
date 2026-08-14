@@ -37,6 +37,10 @@ RUN echo "INSERT OR IGNORE INTO peer (guid, id, uuid, pk, created_at, 'user', st
 # this workaround is needed because QEMU emulating 32 bits platfom on 64 bits host
 # see https://github.com/rust-lang/cargo/issues/8719
 RUN mv /root/.cargo /tmp && rm -rf /root/.cargo && mkdir -p /root/.cargo 
+# The persistent Cargo target cache can retain build-script fingerprints while
+# generated files (src/version.rs and the API webconsole/rapidoc dist trees) are
+# intentionally absent from a fresh Docker layer. Touch both generators inside
+# the build layer so cached Rust targets never depend on out-of-cache assets.
 RUN --mount=type=tmpfs,target=/root/.cargo \
     --mount=type=cache,id=sctgdesk-cargo-registry,target=/root/.cargo/registry \
     --mount=type=cache,id=sctgdesk-cargo-git,target=/root/.cargo/git \
@@ -51,6 +55,7 @@ RUN --mount=type=tmpfs,target=/root/.cargo \
     awk 'BEGIN{net_section=0;git_fetch_found=0;printed=0}/^\[net\]/{net_section=1;print;next}/^\[/{if(net_section&&!git_fetch_found){print "git-fetch-with-cli = true";printed=1}net_section=0;print;next}net_section&&/^git-fetch-with-cli\s*=/{print "git-fetch-with-cli = true";git_fetch_found=1;next}{print}END{if(!printed&&!git_fetch_found){if(!net_section)print "\n[net]";print "git-fetch-with-cli = true"}}' /root/.cargo/config.toml > /root/.cargo/config.tmp && \
     mv /root/.cargo/config.tmp /root/.cargo/config.toml \
     && . /root/.cargo/env && cd /build \
+    && touch build.rs vendor/sctgdesk-api-server/build.rs \
     && DATABASE_URL=sqlite://$(pwd)/db_v2.sqlite3 cargo build --locked --target=$TARGET --release || (echo "Build failed, entering sleep mode for debugging..." && cp -av /root/.cargo /build/ && exit 1) \
     && mkdir -p /build/ubuntu-jammy/bin \
     && cp /build/target/$(cat /build/_target)/release/hbbr /build/ubuntu-jammy/bin/ \
@@ -58,6 +63,13 @@ RUN --mount=type=tmpfs,target=/root/.cargo \
     && cp /build/target/$(cat /build/_target)/release/rustdesk-utils /build/ubuntu-jammy/bin/
 COPY systemd /build/ubuntu-jammy/systemd
 COPY debian /build/ubuntu-jammy/debian
+# Git worktrees created from Windows can materialize the packaging files with
+# CRLF line endings and executable-bit metadata that differs from the index.
+# Normalize the copied build context to the exact modes recorded in Git so the
+# Debian package is reproducible regardless of the host checkout filesystem.
+RUN find /build/ubuntu-jammy/debian /build/ubuntu-jammy/systemd -type f -exec sed -i 's/\r$//' {} + \
+    && find /build/ubuntu-jammy/debian /build/ubuntu-jammy/systemd -type f -exec chmod 0644 {} + \
+    && chmod 0755 /build/ubuntu-jammy/debian/rules
 RUN cd /build/ubuntu-jammy \
     && cat debian/control.tpl | sed "s/{{ ARCH }}/$(dpkg --print-architecture)/" > debian/control \
     && rm debian/control.tpl \
