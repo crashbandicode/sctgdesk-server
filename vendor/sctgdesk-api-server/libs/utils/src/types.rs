@@ -289,11 +289,12 @@ pub struct AbPeer {
     pub rdp_username: Option<String>,
     #[serde(rename = "loginName", skip_serializing_if = "Option::is_none")]
     pub login_name: Option<String>, //login username
+    // Clients read same_server as a JSON bool (unlike forceAlwaysRelay); a string fails
+    // their whole address-book pull. Stored records may still hold "true"/"false".
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        deserialize_with = "from_str_to_bool",
-        serialize_with = "from_bool_to_str"
+        deserialize_with = "from_str_to_bool"
     )]
     pub same_server: Option<bool>,
 }
@@ -789,4 +790,43 @@ pub struct AbSharedNameRequest {
 #[derive(Serialize, Deserialize, Clone, JsonSchema)]
 pub struct DeleteUserRequest {
     pub rows: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AbPeer;
+    use serde_json::{json, Value};
+
+    fn round_trip(stored: Value) -> Value {
+        let peer: AbPeer = serde_json::from_value(stored).unwrap();
+        serde_json::to_value(&peer).unwrap()
+    }
+
+    #[test]
+    fn ab_peer_same_server_serializes_as_bool() {
+        for (stored, expected) in [
+            (json!("true"), true),
+            (json!("false"), false),
+            (json!("1"), true),
+            (json!(true), true),
+            (json!(false), false),
+        ] {
+            let out = round_trip(json!({"id": "1602830107", "same_server": stored}));
+            assert_eq!(out["same_server"], Value::Bool(expected));
+        }
+    }
+
+    #[test]
+    fn ab_peer_same_server_omitted_when_unset() {
+        for stored in [json!({"id": "1"}), json!({"id": "1", "same_server": null})] {
+            let out = round_trip(stored);
+            assert!(out.get("same_server").is_none());
+        }
+    }
+
+    #[test]
+    fn ab_peer_force_always_relay_stays_string() {
+        let out = round_trip(json!({"id": "1", "forceAlwaysRelay": true}));
+        assert_eq!(out["forceAlwaysRelay"], json!("true"));
+    }
 }
